@@ -1,0 +1,112 @@
+name: Release
+
+# Pushing a tag v* builds the binary for each platform with Spinel (see .spinel-version), tests it
+# against the Ruby script, and attaches session-grep-<tag>-<target>.tar.gz and SHA256SUMS to a release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          # The oldest Ubuntu image, so the binary runs with older glibc too
+          - { os: ubuntu-22.04, target: linux-x86_64 }
+          - { os: macos-15, target: darwin-arm64 }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "4.0"
+
+      - name: Install ripgrep
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install ripgrep; else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ripgrep
+          fi
+          rg --version
+
+      - name: Cache Spinel
+        id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/spinel-prefix
+          key: spinel-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('.spinel-version') }}
+
+      - name: Build Spinel
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: script/build-spinel.sh "$HOME/spinel-prefix"
+
+      - name: Build session-grep
+        run: |
+          "$HOME/spinel-prefix/bin/spinel" --version
+          "$HOME/spinel-prefix/bin/spinel" bin/session-grep -o "$RUNNER_TEMP/session-grep"
+
+      - name: Show linked libraries
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then otool -L "$RUNNER_TEMP/session-grep"; else
+            ldd "$RUNNER_TEMP/session-grep"
+            echo "Newest glibc symbol version needed:"
+            objdump -T "$RUNNER_TEMP/session-grep" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          fi
+
+      - name: Test the binary
+        run: SG_BIN="$RUNNER_TEMP/session-grep" ruby -w test/session_grep_test.rb
+
+      - name: Compare output with the Ruby script
+        run: ruby test/compare_binary.rb "$RUNNER_TEMP/session-grep"
+
+      - name: Time the binary against the Ruby script
+        run: ruby test/perf.rb "$RUNNER_TEMP/session-grep"
+
+      - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="session-grep-$TAG-$TARGET"
+          mkdir "$RUNNER_TEMP/$name"
+          cp "$RUNNER_TEMP/session-grep" LICENSE THIRD_PARTY_NOTICES "$RUNNER_TEMP/$name/"
+          tar -C "$RUNNER_TEMP" -czf "$name.tar.gz" "$name"
+          tar -tzvf "$name.tar.gz"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: session-grep-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write # the only job that writes: it creates the release
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum session-grep-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --verify-tag \
+            session-grep-*.tar.gz SHA256SUMS

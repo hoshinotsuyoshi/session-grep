@@ -1,0 +1,716 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# session-grep: search past Claude Code and codex session logs (jsonl) for words and
+# print, per session, what it was about and the command to resume it.
+#
+# For speed, rg narrows down the candidate files and only lines containing a word are parsed as JSON.
+# Requires Ruby 3.4+ (standard library only, no gems) and rg.
+
+if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.4")
+  abort "session-grep: requires Ruby 3.4 or later (running #{RUBY_VERSION} #{RbConfig.ruby}). " \
+        "Put a Ruby 3.4+ earlier on your PATH"
+end
+
+require "json"
+require "open3"
+require "optparse"
+require "set"
+require "shellwords"
+require "time"
+
+module SessionGrep
+  SNIPPET_WIDTH = 160
+  VISIBLE_KINDS = %w[human hc agent].freeze
+  ALL_KINDS = %w[human hc agent tool thinking meta].freeze
+  MESSAGE_KINDS = %w[human hc agent].freeze
+
+  # Claude Code user messages (strings) that are not human input
+  CLAUDE_META_PREFIXES = [
+    "<task-notification>", "<local-command-", "<bash-stdout>", "<bash-stderr>",
+    "<system-reminder>", "<user-prompt-submit-hook>"
+  ].freeze
+  # Messages between agents (e.g. SendMessage)
+  HC_PREFIXES = ["<hc from=", "<hc>", "<teammate-message", "Another Claude session sent a"].freeze
+  # codex role=user messages that codex injected
+  CODEX_META_PREFIXES = [
+    "# AGENTS.md instructions", "<environment_context>", "<user_instructions>",
+    "<turn_aborted>", "<user_shell_command>"
+  ].freeze
+
+  Hit = Struct.new(:kind, :ts, :text, :agent_id, keyword_init: true)
+
+  # Search words (ANDed when several). Tests lines and reports which words they contain
+  class Matcher
+    attr_reader :terms
+
+    def initialize(terms, ignore_case)
+      @terms = terms
+      @ignore_case = ignore_case
+      @needles = ignore_case ? terms.map(&:downcase) : terms
+    end
+
+    def any?(str)
+      s = norm(str)
+      @needles.any? { |n| s.include?(n) }
+    end
+
+    def found(str)
+      s = norm(str)
+      @terms.select.with_index { |_, i| s.include?(@needles[i]) }
+    end
+
+    # Position of the first match (center of the snippet)
+    def index(str)
+      s = norm(str)
+      @needles.filter_map { |n| s.index(n) }.min
+    end
+
+    private
+
+    def norm(str)
+      @ignore_case ? str.to_s.downcase : str.to_s
+    end
+  end
+
+  class Session
+    attr_accessor :tool, :id, :cwd, :branch, :started_at, :updated_at, :title,
+                  :first_prompt, :path, :hits, :counts, :subagents, :terms,
+                  :forked_from, :last_message_at
+
+    def initialize(tool:, id:)
+      @tool = tool
+      @id = id
+      @hits = []
+      @counts = Hash.new(0)
+      @subagents = []
+      @terms = Set.new
+    end
+
+    # Time used for sorting and the heading: the last message (or the log's mtime if none)
+    def sort_time
+      (last_message_at && SessionGrep.parse_ts(last_message_at)) || updated_at
+    end
+
+    def resume_command
+      cmd = tool == "claude" ? "claude --resume #{id}" : "codex resume #{id}"
+      cwd ? "cd #{Shellwords.escape(cwd)} && #{cmd}" : cmd
+    end
+
+    def to_h(kinds)
+      {
+        tool: tool, session_id: id, cwd: cwd, cwd_exists: cwd ? Dir.exist?(cwd) : false,
+        branch: branch, started_at: started_at, last_message_at: last_message_at,
+        updated_at: updated_at&.utc&.iso8601, title: title, first_prompt: first_prompt,
+        forked_from: forked_from,
+        hits: hits.select { |h| kinds.include?(h.kind) }.map { |h| h.to_h.compact },
+        hit_counts: counts, subagents: subagents.uniq,
+        resume: resume_command, path: path
+      }
+    end
+  end
+
+  module_function
+
+  # ---- Common -------------------------------------------------------------
+
+  def parse_json(line)
+    JSON.parse(line)
+  rescue JSON::ParserError, EncodingError
+    nil
+  end
+
+  def parse_ts(ts)
+    ts && Time.parse(ts.to_s)
+  rescue ArgumentError
+    nil
+  end
+
+  def one_line(str)
+    str.to_s.gsub(/\s+/, " ").strip
+  end
+
+  def truncate(str, width = SNIPPET_WIDTH)
+    s = one_line(str)
+    s.length > width ? "#{s[0, width - 1]}…" : s
+  end
+
+  # Cut out the text around the matched word
+  def snippet(text, matcher, width = SNIPPET_WIDTH)
+    s = one_line(text)
+    idx = matcher.index(s)
+    return truncate(s, width) if idx.nil? || s.length <= width
+
+    start = [idx - (width / 3), 0].max
+    piece = s[start, width]
+    "#{start.positive? ? '…' : ''}#{piece}#{start + width < s.length ? '…' : ''}"
+  end
+
+  def starts_with_any?(text, prefixes)
+    t = text.to_s.lstrip
+    prefixes.any? { |p| t.start_with?(p) }
+  end
+
+  # Turn "3d", "12h", "2w", or "2026-10-01" into a Time
+  def parse_time(str, now: Time.now)
+    case str
+    when /\A(\d+)([mhdw])\z/
+      n = Regexp.last_match(1).to_i
+      sec = { "m" => 60, "h" => 3600, "d" => 86_400, "w" => 604_800 }[Regexp.last_match(2)]
+      now - (n * sec)
+    else
+      Time.parse(str)
+    end
+  rescue ArgumentError
+    raise OptionParser::InvalidArgument, "can't parse time: #{str} (e.g. 3d, 12h, 2w, 2026-10-01)"
+  end
+
+  # Keep only files containing the word, using rg. Called in chunks so the argument list stays short
+  def rg_filter(files, term, ignore_case)
+    return [] if files.empty?
+
+    found = []
+    files.each_slice(500) do |chunk|
+      args = ["rg", "-l", "-F", "--no-messages"]
+      args << "-i" if ignore_case
+      args += ["-e", term, "--", *chunk]
+      out, status = Open3.capture2(*args)
+      raise "rg failed (status #{status.exitstatus})" if status.exitstatus > 1
+
+      found.concat(out.split("\n"))
+    end
+    found
+  end
+
+  # Filter with rg per word and keep the files of sessions where every word appears in some file
+  # (one session can span several files, like a Claude parent and its subagents).
+  # rg lists files in no fixed order, so sort them: the order files are read in decides the order of
+  # hits with the same time and of the hit counts (a parent session file sorts before its subagents)
+  def candidate_files(files, matcher, ignore_case, &session_key)
+    per_term = matcher.terms.map { |t| rg_filter(files, t, ignore_case) }
+    common = per_term.map { |fs| fs.to_set(&session_key) }.reduce(:&)
+    per_term.flatten.uniq.sort.select { |f| common.include?(session_key.call(f)) }
+  end
+
+  # Read the file from the end and return the time of the last message (human / hc / agent)
+  def last_message_at(path, mod, chunk: 1 << 20, max_bytes: 32 << 20)
+    File.open(path, "rb") do |f|
+      pos = f.size
+      carry = String.new(encoding: Encoding::BINARY)
+      read = 0
+      while pos.positive? && read < max_bytes
+        n = [chunk, pos].min
+        pos -= n
+        f.seek(pos)
+        buf = f.read(n) + carry
+        read += n
+        lines = buf.split("\n")
+        carry = pos.positive? ? lines.shift.to_s : String.new(encoding: Encoding::BINARY)
+        lines.reverse_each do |l|
+          next unless mod.message_line?(l)
+
+          rec = parse_json(l.dup.force_encoding(Encoding::UTF_8))
+          next unless rec
+
+          kind, = mod.classify(rec)
+          return rec["timestamp"] if MESSAGE_KINDS.include?(kind)
+        end
+      end
+    end
+    nil
+  end
+
+  # Read one file and add lines containing the words to the session, by kind of message
+  def scan_file(path, session, matcher, opts, mod, agent_id: nil)
+    File.foreach(path) do |line|
+      next unless matcher.any?(line)
+
+      rec = parse_json(line)
+      next if rec.nil? || mod.skip?(rec, session)
+
+      kind, text = mod.classify(rec)
+      terms = text ? matcher.found(text) : []
+      # Lines that matched only in metadata (cwd etc.), not the message body, count as meta
+      if terms.empty?
+        kind = "meta"
+        text = line
+        terms = matcher.found(line)
+      end
+      session.counts[kind] += 1
+      next unless opts[:kinds].include?(kind)
+
+      session.terms.merge(terms)
+      session.hits << Hit.new(kind: kind, ts: rec["timestamp"], agent_id: agent_id,
+                              text: snippet(text, matcher))
+    end
+  end
+
+  # ---- Claude Code --------------------------------------------------------
+
+  module Claude
+    module_function
+
+    # Regexp that narrows project directory names from a cwd substring.
+    # A directory name is the cwd with every non-alphanumeric character replaced by "-"
+    def dir_pattern(cwd_filter)
+      return nil if cwd_filter.nil? || cwd_filter.empty?
+
+      Regexp.new(cwd_filter.chars.map { |c| c.match?(/[A-Za-z0-9]/) ? Regexp.escape(c) : "." }.join)
+    end
+
+    def files(root, cwd_filter)
+      pat = dir_pattern(cwd_filter)
+      Dir.glob(File.join(root, "*")).select { |d| File.directory?(d) && (pat.nil? || File.basename(d).match?(pat)) }
+         .flat_map { |d| Dir.glob(File.join(d, "*.jsonl")) + Dir.glob(File.join(d, "*", "subagents", "*.jsonl")) }
+    end
+
+    # For a subagent file, return the parent session's file
+    def parent_path(path)
+      return nil unless File.basename(File.dirname(path)) == "subagents"
+
+      session_dir = File.dirname(File.dirname(path))
+      "#{session_dir}.jsonl"
+    end
+
+    def text_of(content)
+      return content if content.is_a?(String)
+      return "" unless content.is_a?(Array)
+
+      content.map do |c|
+        next "" unless c.is_a?(Hash)
+
+        c["text"] || c["thinking"] || (c["input"] && JSON.generate(c["input"])) ||
+          (c["content"].is_a?(String) ? c["content"] : text_of(c["content"]))
+      end.join("\n")
+    end
+
+    # Turn one JSON line into (kind, text)
+    def classify(rec)
+      msg = rec["message"].is_a?(Hash) ? rec["message"] : {}
+      content = msg["content"]
+      case rec["type"]
+      when "user"
+        # Injected skill bodies, compact summaries, etc.
+        return ["meta", text_of(content)] if rec["isMeta"] || rec["isCompactSummary"]
+
+        if content.is_a?(String)
+          classify_user_text(content)
+        elsif content.is_a?(Array) && content.any? { |c| c.is_a?(Hash) && c["type"] == "tool_result" }
+          ["tool", text_of(content)]
+        else
+          # In the desktop app and elsewhere, a <system-reminder> text block precedes human input.
+          # Classify what remains without it; if nothing remains, it is meta
+          blocks = Array(content)
+          rest = blocks.reject do |c|
+            c.is_a?(Hash) && c["type"] == "text" && SessionGrep.starts_with_any?(c["text"], CLAUDE_META_PREFIXES)
+          end
+          return ["meta", text_of(blocks)] if rest.empty?
+
+          kind, = classify_user_text(text_of(rest))
+          [kind, text_of(rest)]
+        end
+      when "assistant"
+        types = Array(content).map { |c| c.is_a?(Hash) ? c["type"] : nil }
+        if types.include?("text") then ["agent", text_of(content)]
+        elsif types.include?("tool_use") then ["tool", text_of(content)]
+        elsif types.include?("thinking") then ["thinking", text_of(content)]
+        else ["meta", text_of(content)]
+        end
+      else
+        ["meta", nil]
+      end
+    end
+
+    def classify_user_text(text)
+      return ["meta", text] if SessionGrep.starts_with_any?(text, CLAUDE_META_PREFIXES)
+      return ["hc", text] if SessionGrep.starts_with_any?(text, HC_PREFIXES)
+
+      ["human", text]
+    end
+
+    def message_line?(line)
+      line.include?('"type":"user"') || line.include?('"type":"assistant"')
+    end
+
+    # A session created by a fork (/branch etc.) holds copies of the original's lines with forkedFrom.
+    # Those lines show up in the original session, so they are not counted here
+    def skip?(rec, session)
+      return false unless rec["forkedFrom"].is_a?(Hash)
+
+      session.forked_from ||= rec["forkedFrom"]["sessionId"]
+      true
+    end
+
+    # Read session info (cwd, branch, start time, title, first prompt, fork origin).
+    # Large lines (tool output etc.) are not parsed as JSON
+    def read_meta(path, session)
+      session.path ||= path
+      File.foreach(path) do |line|
+        if line.include?('"type":"ai-title"') && line.bytesize < 10_000
+          rec = SessionGrep.parse_json(line)
+          session.title = rec["aiTitle"] if rec && rec["type"] == "ai-title"
+          next
+        end
+        next if session.cwd && session.branch && session.first_prompt
+        next if line.bytesize > 200_000
+
+        rec = SessionGrep.parse_json(line)
+        next unless rec
+
+        session.forked_from ||= rec.dig("forkedFrom", "sessionId") if rec["forkedFrom"].is_a?(Hash)
+        if session.cwd.nil? && rec["cwd"]
+          session.cwd = rec["cwd"]
+          session.started_at ||= rec["timestamp"]
+        end
+        session.branch ||= rec["gitBranch"]
+        next unless session.first_prompt.nil? && rec["type"] == "user"
+
+        kind, text = classify(rec)
+        session.first_prompt = SessionGrep.truncate(text) if kind == "human" && !text.to_s.strip.empty?
+      end
+    end
+
+    # Get the sessionId from the path (file name = sessionId; for subagents, the parent directory name)
+    def session_id(path)
+      parent = parent_path(path)
+      File.basename(parent || path, ".jsonl")
+    end
+
+    def agent_id(path)
+      parent_path(path) ? File.basename(path, ".jsonl").delete_prefix("agent-") : nil
+    end
+  end
+
+  # ---- codex --------------------------------------------------------------
+
+  module Codex
+    module_function
+
+    def files(root)
+      Dir.glob(File.join(root, "sessions", "*", "*", "*", "*.jsonl"))
+    end
+
+    # The id in rollout-<time>-<id>.jsonl
+    def session_id(path)
+      File.basename(path, ".jsonl")[/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\z/] ||
+        File.basename(path, ".jsonl")
+    end
+
+    def titles(root)
+      @titles ||= {}
+      @titles[root] ||= begin
+        t = {}
+        idx = File.join(root, "session_index.jsonl")
+        if File.exist?(idx)
+          File.foreach(idx) do |line|
+            rec = SessionGrep.parse_json(line)
+            t[rec["id"]] = rec["thread_name"] if rec && rec["id"]
+          end
+        end
+        t
+      end
+    end
+
+    def text_of(content)
+      Array(content).map { |c| c.is_a?(Hash) ? (c["text"] || "") : c.to_s }.join("\n")
+    end
+
+    def classify(rec)
+      p = rec["payload"].is_a?(Hash) ? rec["payload"] : {}
+      return ["meta", nil] unless rec["type"] == "response_item"
+
+      case p["type"]
+      when "message"
+        text = text_of(p["content"])
+        case p["role"]
+        when "user"
+          return ["meta", text] if SessionGrep.starts_with_any?(text, CODEX_META_PREFIXES)
+          return ["hc", text] if SessionGrep.starts_with_any?(text, HC_PREFIXES)
+
+          ["human", text]
+        when "assistant" then ["agent", text]
+        else ["meta", text]
+        end
+      when "reasoning"
+        ["thinking", Array(p["summary"]).map { |s| s.is_a?(Hash) ? s["text"] : s }.join("\n")]
+      when "function_call", "custom_tool_call", "local_shell_call"
+        ["tool", p["arguments"] || p["input"] || JSON.generate(p["action"] || {})]
+      when "function_call_output", "custom_tool_call_output"
+        out = p["output"]
+        ["tool", out.is_a?(String) ? out : JSON.generate(out)]
+      else
+        ["tool", nil]
+      end
+    end
+
+    def message_line?(line)
+      line.include?('"type":"response_item"') && line.include?('"type":"message"')
+    end
+
+    # event_msg duplicates the same message as response_item, so it is not counted
+    def skip?(rec, _session)
+      rec["type"] == "event_msg"
+    end
+
+    def read_meta(path, session, root)
+      session.path ||= path
+      session.title ||= titles(root)[session.id]
+      File.foreach(path) do |line|
+        rec = SessionGrep.parse_json(line)
+        next unless rec
+
+        if rec["type"] == "session_meta"
+          p = rec["payload"] || {}
+          session.cwd ||= p["cwd"]
+          session.branch ||= p.dig("git", "branch")
+          session.started_at ||= p["timestamp"]
+          session.forked_from ||= p["forked_from_id"]
+          src = p["source"]
+          session.subagents << "codex:#{src['subagent']}" if src.is_a?(Hash) && src["subagent"]
+          next
+        end
+        next unless rec["type"] == "response_item"
+
+        kind, text = classify(rec)
+        if kind == "human" && !text.to_s.strip.empty?
+          session.first_prompt = SessionGrep.truncate(text)
+          break
+        end
+      end
+    end
+  end
+
+  # ---- Search -------------------------------------------------------------
+
+  def in_range?(path, since, until_t)
+    m = File.mtime(path)
+    (since.nil? || m >= since) && (until_t.nil? || m <= until_t)
+  end
+
+  def excluded?(id, opts)
+    opts[:exclude].any? { |x| id.start_with?(x) }
+  end
+
+  def search(terms, opts)
+    sessions = {}
+    ic = opts[:ignore_case]
+    matcher = Matcher.new(terms, ic)
+
+    if opts[:tools].include?("claude")
+      files = Claude.files(opts[:claude_dir], opts[:cwd]).select { |f| in_range?(f, opts[:since], opts[:until]) }
+      files.reject! { |f| Claude.parent_path(f) } unless opts[:subagents]
+      files.reject! { |f| excluded?(Claude.session_id(f), opts) }
+      candidate_files(files, matcher, ic) { |f| Claude.session_id(f) }.each do |path|
+        id = Claude.session_id(path)
+        s = (sessions[["claude", id]] ||= Session.new(tool: "claude", id: id))
+        parent = Claude.parent_path(path)
+        if s.path.nil?
+          meta_path = parent && File.exist?(parent) ? parent : path
+          Claude.read_meta(meta_path, s)
+          s.updated_at = File.mtime(meta_path)
+        end
+        s.updated_at = [s.updated_at, File.mtime(path)].compact.max
+        scan_file(path, s, matcher, opts, Claude, agent_id: Claude.agent_id(path))
+      end
+    end
+
+    if opts[:tools].include?("codex")
+      files = Codex.files(opts[:codex_dir]).select { |f| in_range?(f, opts[:since], opts[:until]) }
+      files.reject! { |f| excluded?(Codex.session_id(f), opts) }
+      candidate_files(files, matcher, ic) { |f| Codex.session_id(f) }.each do |path|
+        id = Codex.session_id(path)
+        s = (sessions[["codex", id]] ||= Session.new(tool: "codex", id: id))
+        Codex.read_meta(path, s, opts[:codex_dir])
+        s.updated_at = File.mtime(path)
+        scan_file(path, s, matcher, opts, Codex)
+      end
+    end
+
+    list = sessions.values
+    list.select! { |s| s.cwd&.include?(opts[:cwd]) } if opts[:cwd]
+    list.reject! { |s| s.subagents.any? { |a| a.start_with?("codex:") } } unless opts[:subagents]
+    # Drop sessions where the shown kinds of messages don't contain every word (--all checks all kinds)
+    list.select! { |s| s.hits.any? && terms.all? { |t| s.terms.include?(t) } }
+    list.each do |s|
+      s.hits = s.hits.each_with_index.sort_by { |h, i| [h.ts.to_s, i] }.map(&:first)
+      s.last_message_at = last_message_at(s.path, s.tool == "claude" ? Claude : Codex)
+    end
+    list = list.each_with_index.sort_by { |s, i| [s.sort_time, i] }.map(&:first)
+    list = list.last(opts[:limit]) if opts[:limit]
+    list
+  end
+
+  # ---- Output -------------------------------------------------------------
+
+  # Format a time as "HH:MM", or "MM-DD HH:MM" if the date differs from the previous one. Returns [string, date]
+  def stamp(ts, prev_date)
+    t = ts.is_a?(Time) ? ts : parse_ts(ts)
+    return ["", prev_date] if t.nil?
+
+    t = t.localtime
+    date = t.strftime("%Y-%m-%d")
+    [date == prev_date ? t.strftime("%H:%M") : t.strftime("%m-%d %H:%M"), date]
+  end
+
+  def print_text(list, opts, io = $stdout)
+    home = Dir.home
+    list.each do |s|
+      cwd = s.cwd ? s.cwd.sub(home, "~") : "?"
+      head = s.sort_time.localtime
+      date = head.strftime("%Y-%m-%d")
+      line = "#{head.strftime('%Y-%m-%d %H:%M')}  #{s.tool}  #{cwd}  #{s.branch}"
+      # Also show the log's mtime if it is later than the last message (the log grew from tool runs or waiting)
+      if s.last_message_at && s.updated_at && s.updated_at - head >= 60
+        line += "  (log #{stamp(s.updated_at, date).first})"
+      end
+      io.puts line
+      io.puts "  title: #{s.title}" if s.title
+      io.puts "  fork of: #{s.forked_from}" if s.forked_from
+      io.puts "  first: #{s.first_prompt}" if s.first_prompt
+      shown = s.hits.first(opts[:max_hits])
+      prev = date
+      shown.each do |h|
+        who = h.agent_id ? "#{h.kind}@#{h.agent_id[0, 20]}" : h.kind
+        time, prev = stamp(h.ts, prev)
+        io.puts "  [#{who} #{time}] #{h.text}"
+      end
+      rest = s.hits.size - shown.size
+      hidden = s.counts.reject { |k, _| opts[:kinds].include?(k) }.reject { |k, _| k == "meta" }
+      extra = []
+      extra << "+#{rest} more" if rest.positive?
+      extra << hidden.map { |k, n| "#{n} in #{k}" }.join(", ") unless hidden.empty?
+      io.puts "  (#{extra.join('; ')})" unless extra.empty?
+      io.puts "  resume: #{s.resume_command}"
+      io.puts
+    end
+  end
+
+  def print_json(list, opts, io = $stdout)
+    list.each { |s| io.puts JSON.generate(s.to_h(opts[:kinds])) }
+  end
+
+  # ---- --show: one session's messages in time order -----------------------
+
+  def find_session_file(id, opts)
+    claude = Dir.glob(File.join(opts[:claude_dir], "*", "#{id}*.jsonl"))
+    codex = Codex.files(opts[:codex_dir]).select { |f| Codex.session_id(f).start_with?(id) }
+    found = claude.map { |f| ["claude", f] } + codex.map { |f| ["codex", f] }
+    raise "session not found: #{id}" if found.empty?
+    raise "id matches more than one session; give a longer prefix: #{found.map(&:last).join(' ')}" if found.size > 1
+
+    found.first
+  end
+
+  def show(id, opts, io = $stdout)
+    tool, path = find_session_file(id, opts)
+    mod = tool == "claude" ? Claude : Codex
+    s = Session.new(tool: tool, id: mod.session_id(path))
+    tool == "claude" ? Claude.read_meta(path, s) : Codex.read_meta(path, s, opts[:codex_dir])
+    if opts[:json]
+      io.puts JSON.generate(s.to_h([]).except(:hits, :hit_counts))
+    else
+      io.puts "#{tool}  #{s.id}  #{s.cwd}  #{s.branch}"
+      io.puts "  title: #{s.title}" if s.title
+      io.puts "  fork of: #{s.forked_from}" if s.forked_from
+      io.puts "  resume: #{s.resume_command}"
+      io.puts
+    end
+    prev = nil
+    File.foreach(path) do |line|
+      next if line.bytesize > 2_000_000
+
+      rec = parse_json(line)
+      next unless rec
+      next if tool == "codex" && rec["type"] == "event_msg"
+
+      kind, text = mod.classify(rec)
+      next unless opts[:kinds].include?(kind) && !text.to_s.strip.empty?
+
+      body = opts[:full] ? text.to_s : truncate(text, 400)
+      if opts[:json]
+        io.puts JSON.generate({ kind: kind, ts: rec["timestamp"], text: body })
+      else
+        time, prev = stamp(rec["timestamp"], prev)
+        io.puts "[#{kind} #{time}] #{body}"
+      end
+    end
+  end
+
+  # ---- CLI ----------------------------------------------------------------
+
+  def parse_args(argv, env: ENV)
+    opts = {
+      tools: %w[claude codex], kinds: VISIBLE_KINDS.dup, json: false, ignore_case: false,
+      since: nil, until: nil, cwd: nil, limit: nil, max_hits: 3, subagents: true,
+      claude_dir: env.fetch("SESSION_GREP_CLAUDE_DIR", File.join(Dir.home, ".claude", "projects")),
+      codex_dir: env.fetch("SESSION_GREP_CODEX_DIR", File.join(Dir.home, ".codex")),
+      show: nil, full: false, terms: [], exclude: [], include_self: false
+    }
+    parser = OptionParser.new do |o|
+      o.banner = <<~USAGE
+        Usage: session-grep [options] WORD [WORD...]
+               session-grep [options] -e WORD [-e WORD...]
+               session-grep --show SESSION_ID [--full] [--json]
+
+        Search past Claude Code (~/.claude/projects) and codex (~/.codex/sessions) sessions
+        for WORD (a fixed string) and print, per session, the cwd, branch, title, first prompt,
+        matching messages, and a resume command.
+        - Multiple WORDs are ANDed (all must appear somewhere in the same session, not necessarily on one line)
+        - Sessions are listed oldest first by their last message (newest at the bottom). Matches within a session are in time order
+        - Times are "HH:MM", or "MM-DD HH:MM" when the date differs from the previous line
+        - The session running the search ($CLAUDE_CODE_SESSION_ID) is excluded by default
+
+      USAGE
+      o.on("-e WORD", "Search word. Repeat for AND") { |v| opts[:terms] << v }
+      o.on("--tool TOOL", %w[claude codex all], "claude / codex / all (default: all)") do |v|
+        opts[:tools] = v == "all" ? %w[claude codex] : [v]
+      end
+      o.on("--cwd SUBSTR", "--repo SUBSTR",
+           "Only sessions whose cwd contains SUBSTR (e.g. example-org).",
+           "Matched against the cwd the session started in, so sessions started elsewhere are not included") { |v| opts[:cwd] = v }
+      o.on("--since TIME", "Only logs updated at or after TIME (3d, 12h, 2w, 2026-10-01)") { |v| opts[:since] = parse_time(v) }
+      o.on("--until TIME", "Only logs updated at or before TIME") { |v| opts[:until] = parse_time(v) }
+      o.on("-i", "--ignore-case", "Ignore case") { opts[:ignore_case] = true }
+      o.on("--all", "Also show matches in tool input/output, thinking, and meta (skill list, AGENTS.md, etc.)") do
+        opts[:kinds] = ALL_KINDS.dup
+      end
+      o.on("--no-subagents", "Leave out matches in subagent logs") { opts[:subagents] = false }
+      o.on("--exclude-session ID", "Exclude this session (prefix match, repeatable; use it for your own codex session)") do |v|
+        opts[:exclude] << v
+      end
+      o.on("--include-self", "Include the $CLAUDE_CODE_SESSION_ID session") { opts[:include_self] = true }
+      o.on("--limit N", Integer, "Only the newest N sessions") { |v| opts[:limit] = v }
+      o.on("--hits N", Integer, "Matching lines shown per session (default 3; --json prints all)") { |v| opts[:max_hits] = v }
+      o.on("--json", "Print JSON Lines (one session per line)") { opts[:json] = true }
+      o.on("--show ID", "Print one session's messages in time order (ID is a prefix)") { |v| opts[:show] = v }
+      o.on("--full", "With --show, don't truncate messages") { opts[:full] = true }
+      o.on("--claude-dir DIR", "Default: ~/.claude/projects") { |v| opts[:claude_dir] = v }
+      o.on("--codex-dir DIR", "Default: ~/.codex") { |v| opts[:codex_dir] = v }
+    end
+    rest = parser.parse(argv)
+    opts[:terms].concat(rest)
+    self_id = env["CLAUDE_CODE_SESSION_ID"].to_s
+    opts[:exclude] << self_id unless opts[:include_self] || self_id.empty?
+    [opts, parser]
+  end
+
+  def main(argv)
+    opts, parser = parse_args(argv)
+    if opts[:show]
+      show(opts[:show], opts)
+      return 0
+    end
+    if opts[:terms].empty? || opts[:terms].any?(&:empty?)
+      warn parser.help
+      return 2
+    end
+    list = search(opts[:terms].uniq, opts)
+    opts[:json] ? print_json(list, opts) : print_text(list, opts)
+    list.empty? ? 1 : 0
+  rescue OptionParser::ParseError, RuntimeError => e
+    warn "session-grep: #{e.message}"
+    2
+  end
+end
+
+exit SessionGrep.main(ARGV) if $PROGRAM_NAME == __FILE__

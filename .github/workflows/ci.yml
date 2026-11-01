@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (Ruby ${{ matrix.ruby }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The lowest version the README requires (Ruby 3.4+) and the latest. setup-ruby installs the latest patch of each
+        ruby: ["3.4", "4.0"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: ${{ matrix.ruby }}
+
+      - name: Install ripgrep
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ripgrep
+          rg --version
+
+      - name: Syntax check
+        run: |
+          ruby -v
+          ruby -wc bin/session-grep
+          for f in test/*.rb; do ruby -wc "$f"; done
+
+      - name: Test (fail on Ruby warnings)
+        run: |
+          ruby -w test/session_grep_test.rb 2> "$RUNNER_TEMP/stderr.log" || { cat "$RUNNER_TEMP/stderr.log"; exit 1; }
+          cat "$RUNNER_TEMP/stderr.log"
+          if grep -n 'warning:' "$RUNNER_TEMP/stderr.log"; then
+            echo "::error::Ruby printed warnings"
+            exit 1
+          fi
+
+  # The same tests against a binary compiled from bin/session-grep with Spinel (see .spinel-version).
+  # macOS only on manual runs: macOS minutes cost more, and it is easy to try on a Mac by hand.
+  binary:
+    name: binary (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["ubuntu-22.04", "macos-15"]') || fromJSON('["ubuntu-22.04"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 2 # to see whether a pull request changes .spinel-version or the script
+
+      - uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1.338.0
+        with:
+          ruby-version: "4.0"
+
+      - name: Install ripgrep
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then brew install ripgrep; else
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq --no-install-recommends ripgrep
+          fi
+          rg --version
+
+      - name: Cache Spinel
+        id: cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/spinel-prefix
+          key: spinel-${{ matrix.os }}-${{ runner.arch }}-${{ hashFiles('.spinel-version') }}
+
+      - name: Build Spinel
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: script/build-spinel.sh "$HOME/spinel-prefix"
+
+      - name: Build session-grep
+        run: |
+          "$HOME/spinel-prefix/bin/spinel" --version
+          "$HOME/spinel-prefix/bin/spinel" bin/session-grep -o "$RUNNER_TEMP/session-grep"
+
+      - name: Show linked libraries
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then otool -L "$RUNNER_TEMP/session-grep"; else
+            ldd "$RUNNER_TEMP/session-grep"
+            echo "Newest glibc symbol version needed:"
+            objdump -T "$RUNNER_TEMP/session-grep" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1
+          fi
+
+      - name: Test the binary (fail on Ruby warnings)
+        run: |
+          SG_BIN="$RUNNER_TEMP/session-grep" ruby -w test/session_grep_test.rb 2> "$RUNNER_TEMP/stderr.log" || { cat "$RUNNER_TEMP/stderr.log"; exit 1; }
+          cat "$RUNNER_TEMP/stderr.log"
+          if grep -n 'warning:' "$RUNNER_TEMP/stderr.log"; then
+            echo "::error::Ruby printed warnings"
+            exit 1
+          fi
+
+      - name: Compare output with the Ruby script
+        run: ruby test/compare_binary.rb "$RUNNER_TEMP/session-grep"
+
+      # Timing on shared runners varies, so only on manual runs and on pull requests that change
+      # the Spinel version or the script. It fails only when the binary is over 1.5x slower.
+      - name: Check whether to time
+        id: perf
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ] ||
+             { [ "$EVENT" = pull_request ] && ! git diff --quiet HEAD^1 HEAD -- .spinel-version bin/session-grep; }; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Time the binary against the Ruby script
+        if: steps.perf.outputs.run == 'true'
+        run: ruby test/perf.rb "$RUNNER_TEMP/session-grep"
