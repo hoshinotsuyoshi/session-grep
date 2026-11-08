@@ -24,7 +24,7 @@ It answers "which session was that conversation in?". It also works as a Claude 
 
 ### Prebuilt binary
 
-Each release has an archive per platform with the `session-grep` binary, `LICENSE`, and `THIRD_PARTY_NOTICES`. The repository is private, so download it with [gh](https://cli.github.com/) (logged in):
+Each release has an archive per platform with the `session-grep` binary, `LICENSE`, and `THIRD_PARTY_NOTICES`. Download it from the [Releases](https://github.com/hoshinotsuyoshi/session-grep/releases) page, or with [gh](https://cli.github.com/):
 
 ```sh
 gh release download --repo hoshinotsuyoshi/session-grep --pattern '*-darwin-arm64.tar.gz' --pattern SHA256SUMS
