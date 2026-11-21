@@ -16,16 +16,6 @@ SCRIPT = File.expand_path("../bin/session-grep", __dir__)
 CLI = ENV["SG_BIN"] ? [File.expand_path(ENV["SG_BIN"])] : [RbConfig.ruby, SCRIPT]
 load SCRIPT
 
-# Lets a test make rg list files in reverse order, since its real order is not fixed
-module ReverseRgOrder
-  attr_accessor :reverse_rg
-
-  def rg_filter(*)
-    reverse_rg ? super.sort.reverse : super
-  end
-end
-SessionGrep.singleton_class.prepend(ReverseRgOrder)
-
 class SessionGrepTest < Minitest::Test
   CWD_A = "/Users/x/src/github.com/example-org/app-01"
   CWD_B = "/Users/x/src/github.com/other/repo"
@@ -367,15 +357,15 @@ class SessionGrepTest < Minitest::Test
     assert_equal "afable-1", hits.first["agent_id"]
   end
 
-  # rg lists matching files in no fixed order; they are read in sorted order, parent before subagents
+  # rg prints matching files in no fixed order; they are read in sorted order, parent before subagents
   def test_candidate_files_are_sorted
-    SessionGrep.reverse_rg = true
     files = Dir.glob(File.join(@claude, "**", "*.jsonl"))
     matcher = SessionGrep::Matcher.new(["elder"], false)
-    found = SessionGrep.candidate_files(files, matcher, false) { |f| SessionGrep::Claude.session_id(f) }
+    opts = { kinds: SessionGrep::VISIBLE_KINDS, ignore_case: false }
+    scans = SessionGrep.scan_files(files, matcher, opts, SessionGrep::Claude)
+    reversed = scans.keys.sort.reverse.to_h { |f| [f, scans[f]] }
+    found = SessionGrep.candidate_files(reversed, matcher) { |f| SessionGrep::Claude.session_id(f) }
     assert_equal ["#{SID}.jsonl", "agent-afable-1.jsonl"], found.map { |f| File.basename(f) }
-  ensure
-    SessionGrep.reverse_rg = false
   end
 
   # Hits with the same timestamp (or none) keep the order they appear in the log
@@ -493,6 +483,105 @@ class SessionGrepTest < Minitest::Test
     list, _, status = json_cli("-e", "対応済み", "-e", "apple", "--tool", "claude")
     assert_empty list
     assert_equal 1, status.exitstatus
+  end
+
+  # The title is the last ai-title line wherever it is, though the rest of the info is read only
+  # from the start of the file. A huge line with the marker is not a title
+  def test_title_is_last_ai_title_line
+    sid = "66666666-6666-6666-6666-666666666666"
+    records = [{ type: "ai-title", aiTitle: "old title", sessionId: sid },
+               user(CWD_B, sid, "mango を調べて", "2026-10-06T00:00:00Z")]
+    records += (1..50).map { |i| assistant(CWD_B, sid, [{ type: "text", text: "line #{i}" }], "2026-10-06T00:01:00Z") }
+    records << { type: "ai-title", aiTitle: "new title", sessionId: sid }
+    records << { type: "ai-title", aiTitle: "huge #{'x' * 10_000}", sessionId: sid }
+    write_jsonl(File.join(@claude, CWD_B.gsub(/[^A-Za-z0-9]/, "-"), "#{sid}.jsonl"), records)
+    list, = json_cli("mango", "--tool", "claude")
+    assert_equal "new title", list.first["title"]
+    assert_equal "mango を調べて", list.first["first_prompt"]
+    out, = run_cli("--show", sid[0, 8])
+    assert_match(/title: new title/, out)
+    list, = json_cli("--list", "--cwd", CWD_B, "--tool", "claude")
+    assert_equal "new title", list.find { |s| s["session_id"] == sid }["title"]
+  end
+
+  # A null aiTitle on the last ai-title line clears the title, as when every line was read
+  def test_title_null_on_last_line
+    sid = "77777777-7777-7777-7777-777777777777"
+    write_jsonl(File.join(@claude, CWD_B.gsub(/[^A-Za-z0-9]/, "-"), "#{sid}.jsonl"), [
+      user(CWD_B, sid, "papaya の件", "2026-10-06T00:00:00Z"),
+      { type: "ai-title", aiTitle: "papaya", sessionId: sid },
+      { type: "ai-title", aiTitle: nil, sessionId: sid }
+    ])
+    list, = json_cli("papaya", "--tool", "claude")
+    assert_nil list.first["title"]
+  end
+
+  def test_top_level_type
+    t = ->(line) { SessionGrep.top_level_type(line) }
+    assert_equal "event_msg", t.call('{"timestamp":"2026-10-03T01:00:00Z","type":"event_msg","payload":{"type":"x"}}')
+    assert_equal "event_msg", t.call('{"timestamp":"2026-10-03T01:00:00Z","ordinal":12,"type":"event_msg","payload":{}}')
+    assert_equal "user", t.call(%({"parentUuid":null,"isSidechain":false, "type" : "user","message":{}}\n))
+    # Gives up at an object or array before the key, and at escapes
+    assert_nil t.call('{"payload":{"type":"event_msg"},"type":"response_item"}')
+    assert_nil t.call('{"list":[1],"type":"event_msg"}')
+    assert_nil t.call('{"note":"say \"hi\"","type":"event_msg"}')
+    assert_nil t.call("{\"type\":\"event#{92.chr}u005fmsg\"}") # an escaped "_"
+    assert_nil t.call('{"type":null}')
+    assert_nil t.call('{"timestamp":"2026-10-03T01:00:00Z","type":"event')
+    assert_nil t.call("not json")
+  end
+
+  def test_complete_json
+    assert SessionGrep.complete_json?(%({"type":"attachment"}\n))
+    refute SessionGrep.complete_json?(%({"type":"attachment","attachment":{"content":"banana))
+    refute SessionGrep.complete_json?("")
+  end
+
+  # Lines that can't be a message are counted as meta without parsing, and the counts stay the same
+  # as when every line is parsed: a broken line is not counted, nor is a forked copy, and a line with
+  # a nested "type":"user" is parsed and still counted once
+  def test_claude_meta_lines_counted_without_parsing
+    sid = "88888888-8888-8888-8888-888888888888"
+    path = File.join(@claude, CWD_B.gsub(/[^A-Za-z0-9]/, "-"), "#{sid}.jsonl")
+    write_jsonl(path, [
+      user(CWD_B, sid, "quince はどう?", "2026-10-07T00:00:00Z"),
+      { type: "attachment", sessionId: sid, attachment: { content: "quince skill" } },
+      { type: "attachment", sessionId: sid, attachment: { messages: [{ type: "user", text: "quince" }] } },
+      { type: "system", sessionId: sid, content: "quince", forkedFrom: { sessionId: SID, messageUuid: "u" } }
+    ])
+    # Written with spaces: not judged by the compact `"type":"user"`, so it is parsed
+    File.write(path, %({"type": "user", "cwd": "#{CWD_B}", "timestamp": "2026-10-07T00:01:00Z", ) +
+                     %("message": {"role": "user", "content": "quince again"}}\n), mode: "a")
+    File.write(path, %({"type":"attachment","attachment":{"content":"quince), mode: "a") # being written
+    list, = json_cli("quince", "--tool", "claude")
+    s = list.first
+    assert_equal({ "human" => 2, "meta" => 2 }, s["hit_counts"])
+    assert_equal SID, s["forked_from"]
+    list, = json_cli("quince", "--tool", "claude", "--all")
+    assert_equal({ "human" => 2, "meta" => 2 }, list.first["hit_counts"])
+  end
+
+  # codex: event_msg is skipped and other non-message types are meta, judged from the top-level type
+  # even with keys before it (ordinal) or after payload (then the line is parsed)
+  def test_codex_lines_judged_by_top_level_type
+    id = "019a0000-eeee-7bbb-8ccc-dddddddddddd"
+    path = File.join(@codex, "sessions", "2026", "10", "08", "rollout-2026-10-08T10-00-00-#{id}.jsonl")
+    write_jsonl(path, [
+      { timestamp: "2026-10-08T01:00:00Z", type: "session_meta",
+        payload: { id: id, cwd: CWD_B, timestamp: "2026-10-08T01:00:00Z", source: "cli" } },
+      { timestamp: "2026-10-08T01:00:01Z", ordinal: 1, type: "response_item",
+        payload: { type: "message", role: "user", content: [{ type: "input_text", text: "lychee を調べて" }] } },
+      { timestamp: "2026-10-08T01:00:01Z", ordinal: 2, type: "event_msg",
+        payload: { type: "user_message", message: "lychee を調べて" } },
+      { payload: { type: "user_message", message: "lychee" }, timestamp: "2026-10-08T01:00:01Z", type: "event_msg" },
+      { timestamp: "2026-10-08T01:00:02Z", ordinal: 3, type: "turn_context", payload: { note: "lychee" } },
+      { payload: { type: "message", role: "assistant", content: [{ type: "output_text", text: "lychee は 3 件" }] },
+        timestamp: "2026-10-08T01:00:03Z", type: "response_item" }
+    ])
+    list, = json_cli("lychee", "--tool", "codex")
+    s = list.find { |x| x["session_id"] == id }
+    assert_equal({ "human" => 1, "agent" => 1, "meta" => 1 }, s["hit_counts"])
+    assert_equal %w[human agent], s["hits"].map { |h| h["kind"] }
   end
 
   def test_parse_time

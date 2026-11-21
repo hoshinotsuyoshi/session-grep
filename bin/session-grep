@@ -4,7 +4,8 @@
 # session-grep: search past Claude Code and codex session logs (jsonl) for words and
 # print, per session, what it was about and the command to resume it.
 #
-# For speed, rg narrows down the candidate files and only lines containing a word are parsed as JSON.
+# For speed, rg prints only the lines containing a word, and of those only lines that can be a
+# message are parsed as JSON.
 # Requires Ruby 3.4+ (standard library only, no gems) and rg.
 
 if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.4")
@@ -13,7 +14,6 @@ if Gem::Version.new(RUBY_VERSION) < Gem::Version.new("3.4")
 end
 
 require "json"
-require "open3"
 require "optparse"
 require "set"
 require "shellwords"
@@ -167,35 +167,192 @@ module SessionGrep
 
   RG_CHUNK = 500
 
-  # Keep only files containing the word, using rg. Called in chunks so the argument list stays short.
-  # The chunk is a plain local, not an each_slice block parameter: the Spinel build doesn't keep that
-  # parameter alive for its GC, so a collection could free it while rg's arguments were being built
-  # and the binary then looped forever
-  def rg_filter(files, term, ignore_case)
-    found = []
+  # Run rg over files and yield (file, line) for each matching line. Called in chunks so the argument
+  # list stays short. The chunk is a plain local, not an each_slice block parameter: the Spinel build
+  # doesn't keep that parameter alive for its GC, so a collection could free it while rg's arguments
+  # were being built and the binary then looped forever
+  def rg_lines(files, patterns, ignore_case)
     i = 0
     while i < files.size
       chunk = files[i, RG_CHUNK]
       i += RG_CHUNK
-      args = ["rg", "-l", "-F", "--no-messages"]
+      args = ["rg", "-F", "-H", "--null", "--no-messages"]
       args << "-i" if ignore_case
-      args += ["-e", term, "--"] + chunk
-      out, status = Open3.capture2(*args)
-      raise "rg failed (status #{status.exitstatus})" if status.exitstatus > 1
+      patterns.each { |p| args << "-e" << p }
+      args << "--"
+      args += chunk
+      IO.popen(args, "rb") do |io|
+        io.each_line do |l|
+          z = l.index("\0")
+          next unless z
 
-      found.concat(out.split("\n"))
+          file = l.byteslice(0, z).force_encoding(Encoding::UTF_8)
+          yield file, l.byteslice(z + 1, l.bytesize - z - 1).force_encoding(Encoding::UTF_8)
+        end
+      end
+      raise "rg failed (status #{$?.exitstatus})" if $?.exitstatus > 1
     end
-    found
   end
 
-  # Filter with rg per word and keep the files of sessions where every word appears in some file
-  # (one session can span several files, like a Claude parent and its subagents).
-  # rg lists files in no fixed order, so sort them: the order files are read in decides the order of
-  # hits with the same time and of the hit counts (a parent session file sorts before its subagents)
-  def candidate_files(files, matcher, ignore_case, &session_key)
-    per_term = matcher.terms.map { |t| rg_filter(files, t, ignore_case) }
+  # The words found in one file and its lines containing a word, judged line by line
+  class FileScan
+    attr_accessor :terms, :entries, :fork_origin
+
+    def initialize
+      @terms = Set.new
+      @entries = []
+      @fork_origin = nil
+    end
+  end
+
+  # One judged line: its kind, time, the words in it, and the snippet (only for shown kinds)
+  class Entry
+    attr_reader :kind, :ts, :terms, :text
+
+    def initialize(kind, ts, terms, text)
+      @kind = kind
+      @ts = ts
+      @terms = terms
+      @text = text
+    end
+  end
+
+  # One rg run prints every line containing a word, so only those lines are read, not whole files.
+  # Each line becomes an Entry. Unless meta is shown,
+  # lines that can't be a message (mod.meta_line?) are counted as meta without JSON parsing.
+  # Returns { file => FileScan }
+  def scan_files(files, matcher, opts, mod)
+    scans = {}
+    gate = !opts[:kinds].include?("meta")
+    rg_lines(files, matcher.terms, opts[:ignore_case]) do |file, line|
+      scan = (scans[file] ||= FileScan.new)
+      found = matcher.found(line)
+      # rg -i and Ruby's downcase can disagree on a non-ASCII word. With one word, rg's match says which
+      found = matcher.terms if found.empty? && matcher.terms.size == 1
+      scan.terms.merge(found)
+      next unless matcher.any?(line)
+
+      if gate
+        verdict = mod.meta_line?(line)
+        next if verdict == :skip
+
+        if verdict == :meta && complete_json?(line)
+          scan.entries << Entry.new("meta", nil, matcher.found(line), nil)
+          next
+        end
+      end
+      rec = parse_json(line)
+      next if rec.nil?
+
+      if mod.skip?(rec)
+        scan.fork_origin ||= mod.fork_origin(rec)
+        next
+      end
+      kind, text = mod.classify(rec)
+      terms = text ? matcher.found(text) : []
+      # Lines that matched only in metadata (cwd etc.), not the message body, count as meta
+      if terms.empty?
+        kind = "meta"
+        text = line
+        terms = matcher.found(line)
+      end
+      scan.entries << Entry.new(kind, rec["timestamp"], terms, opts[:kinds].include?(kind) ? snippet(text, matcher) : nil)
+    end
+    scans
+  end
+
+  # A line counted as meta without parsing must still look like a whole JSON object, since a line
+  # that fails to parse is not counted (e.g. the last line of a log that is still being written)
+  def complete_json?(line)
+    i = line.bytesize - 1
+    i -= 1 while i >= 0 && line.getbyte(i) <= 32
+    i >= 0 && line.getbyte(i) == 125
+  end
+
+  # Keep the files of sessions where every word appears in some file (one session can span several
+  # files, like a Claude parent and its subagents). rg prints files in no fixed order, so sort them:
+  # the order files are read in decides the order of hits with the same time and of the hit counts
+  # (a parent session file sorts before its subagents).
+  # The sets are made with to_set and a block on purpose: when every Set in the program comes from a
+  # bare Set.new, the Spinel build compiles Set.new to a version whose sets its GC frees while they are
+  # still in use (Session#terms broke under SPINEL_GC_STRESS=2)
+  def candidate_files(scans, matcher, &session_key)
+    files = scans.keys
+    per_term = matcher.terms.map { |t| files.select { |f| scans[f].terms.include?(t) } }
     common = per_term.map { |fs| fs.to_set(&session_key) }.reduce(:&)
-    per_term.flatten.uniq.sort.select { |f| common.include?(session_key.call(f)) }
+    files.sort.select { |f| common.include?(session_key.call(f)) }
+  end
+
+  # Add one file's judged lines to its session
+  def add_hits(session, scan, opts, agent_id)
+    session.forked_from ||= scan.fork_origin
+    scan.entries.each do |e|
+      session.counts[e.kind] += 1
+      next unless opts[:kinds].include?(e.kind)
+
+      session.terms.merge(e.terms)
+      session.hits << Hit.new(kind: e.kind, ts: e.ts, agent_id: agent_id, text: e.text)
+    end
+  end
+
+  # The value of the top-level "type" key of a JSON line, read from the start without parsing the
+  # whole line. Gives up (nil) at the first object or array value, or at anything unusual (escapes etc.)
+  def top_level_type(line)
+    n = line.bytesize
+    i = skip_space(line, 0)
+    return nil unless line.getbyte(i) == 123 # {
+
+    i += 1
+    while i < n
+      i = skip_space(line, i)
+      return nil unless line.getbyte(i) == 34 # "
+
+      key_end = string_end(line, i)
+      return nil unless key_end
+
+      key = line.byteslice(i + 1, key_end - i - 2)
+      i = skip_space(line, key_end)
+      return nil unless line.getbyte(i) == 58 # :
+
+      i = skip_space(line, i + 1)
+      c = line.getbyte(i)
+      if c == 34
+        value_end = string_end(line, i)
+        return nil unless value_end
+        return line.byteslice(i + 1, value_end - i - 2) if key == "type"
+
+        i = value_end
+      else
+        return nil if c.nil? || c == 123 || c == 91 || key == "type" # { [
+        i += 1 while i < n && line.getbyte(i) != 44 && line.getbyte(i) != 125 # , }
+      end
+      i = skip_space(line, i)
+      return nil unless line.getbyte(i) == 44
+
+      i += 1
+    end
+    nil
+  end
+
+  def skip_space(line, i)
+    n = line.bytesize
+    i += 1 while i < n && line.getbyte(i) <= 32
+    i
+  end
+
+  # Index just past the closing quote of the string starting at i. nil for a string with escapes,
+  # so a key or value is never misread
+  def string_end(line, i)
+    n = line.bytesize
+    j = i + 1
+    while j < n
+      b = line.getbyte(j)
+      return nil if b == 92 # backslash
+      return j + 1 if b == 34
+
+      j += 1
+    end
+    nil
   end
 
   # Read the file from the end and return the time of the last message (human / hc / agent)
@@ -224,31 +381,6 @@ module SessionGrep
       end
     end
     nil
-  end
-
-  # Read one file and add lines containing the words to the session, by kind of message
-  def scan_file(path, session, matcher, opts, mod, agent_id: nil)
-    File.foreach(path) do |line|
-      next unless matcher.any?(line)
-
-      rec = parse_json(line)
-      next if rec.nil? || mod.skip?(rec, session)
-
-      kind, text = mod.classify(rec)
-      terms = text ? matcher.found(text) : []
-      # Lines that matched only in metadata (cwd etc.), not the message body, count as meta
-      if terms.empty?
-        kind = "meta"
-        text = line
-        terms = matcher.found(line)
-      end
-      session.counts[kind] += 1
-      next unless opts[:kinds].include?(kind)
-
-      session.terms.merge(terms)
-      session.hits << Hit.new(kind: kind, ts: rec["timestamp"], agent_id: agent_id,
-                              text: snippet(text, matcher))
-    end
   end
 
   # ---- Claude Code --------------------------------------------------------
@@ -340,24 +472,54 @@ module SessionGrep
 
     # A session created by a fork (/branch etc.) holds copies of the original's lines with forkedFrom.
     # Those lines show up in the original session, so they are not counted here
-    def skip?(rec, session)
-      return false unless rec["forkedFrom"].is_a?(Hash)
-
-      session.forked_from ||= rec["forkedFrom"]["sessionId"]
-      true
+    def skip?(rec)
+      rec["forkedFrom"].is_a?(Hash)
     end
 
-    # Read session info (cwd, branch, start time, title, first prompt, fork origin).
-    # Large lines (tool output etc.) are not parsed as JSON
-    def read_meta(path, session)
+    def fork_origin(rec)
+      rec["forkedFrom"]["sessionId"]
+    end
+
+    # :meta when the line can't be a message, judged without parsing: classify only reads lines whose
+    # top-level type is user or assistant, and a JSON string can't hold a bare `"type":"user"` (its
+    # quotes would be escaped), so a compact line without either can only be meta. Lines written
+    # with spaces (no `"type":"` at all) and lines with forkedFrom (skipped rather than counted) are parsed
+    def meta_line?(line)
+      return nil unless line.include?('"type":"')
+      return nil if line.include?('"type":"user"') || line.include?('"type":"assistant"') || line.include?('"forkedFrom"')
+
+      :meta
+    end
+
+    TITLE_MARK = '"type":"ai-title"'
+
+    # The title of each file: its last ai-title line, found with one rg run over all the files.
+    # Returns { file => [title] } (the array tells a title of null from no ai-title line)
+    def title_map(paths)
+      found = {}
+      SessionGrep.rg_lines(paths, [TITLE_MARK], false) do |file, line|
+        next unless title_line?(line)
+
+        rec = SessionGrep.parse_json(line)
+        found[file] = [rec["aiTitle"]] if rec && rec["type"] == "ai-title"
+      end
+      found
+    end
+
+    def title_line?(line)
+      line.include?(TITLE_MARK) && line.bytesize < 10_000
+    end
+
+    # Read session info (cwd, branch, start time, first prompt, fork origin) from the start of the
+    # file, stopping once cwd, branch and first prompt are known. The title comes from title_map(), since
+    # it can be anywhere. Large lines (tool output etc.) are not parsed as JSON
+    def read_meta(path, session, titles)
       session.path ||= path
+      title = titles[path]
+      session.title = title.first if title
       File.foreach(path) do |line|
-        if line.include?('"type":"ai-title"') && line.bytesize < 10_000
-          rec = SessionGrep.parse_json(line)
-          session.title = rec["aiTitle"] if rec && rec["type"] == "ai-title"
-          next
-        end
-        next if session.cwd && session.branch && session.first_prompt
+        next if title_line?(line)
+        break if session.cwd && session.branch && session.first_prompt
         next if line.bytesize > 200_000
 
         rec = SessionGrep.parse_json(line)
@@ -454,8 +616,21 @@ module SessionGrep
     end
 
     # event_msg duplicates the same message as response_item, so it is not counted
-    def skip?(rec, _session)
+    def skip?(rec)
       rec["type"] == "event_msg"
+    end
+
+    def fork_origin(_rec)
+      nil
+    end
+
+    # Judged from the top-level type, read from the start of the line (codex puts it before payload):
+    # :skip for event_msg, :meta for any type other than response_item, nil (parse it) otherwise
+    def meta_line?(line)
+      type = SessionGrep.top_level_type(line)
+      return nil if type.nil? || type == "response_item"
+
+      type == "event_msg" ? :skip : :meta
     end
 
     def read_meta(path, session, root)
@@ -504,33 +679,47 @@ module SessionGrep
 
     if opts[:tools].include?("claude")
       files = Claude.files(opts[:claude_dir], opts[:cwd]).select { |f| in_range?(f, opts[:since], opts[:until]) }
-      files.reject! { |f| Claude.parent_path(f) } unless opts[:subagents]
-      files.reject! { |f| excluded?(Claude.session_id(f), opts) }
-      files = opts[:list] ? files.sort : candidate_files(files, matcher, ic) { |f| Claude.session_id(f) }
+      # reject, not reject!: with reject! here and below, Spinel 5f01c67fc typed the block parameter as a
+      # C string while the array held Spinel strings, and the generated C did not compile
+      files = files.reject { |f| Claude.parent_path(f) } unless opts[:subagents]
+      files = files.reject { |f| excluded?(Claude.session_id(f), opts) }
+      scans = {}
+      unless opts[:list]
+        scans = scan_files(files, matcher, opts, Claude)
+        files = candidate_files(scans, matcher) { |f| Claude.session_id(f) }
+      end
+      files = files.sort
+      # A session's info is read from the parent's file when the session has one
+      meta_paths = files.to_h { |f| [f, (parent = Claude.parent_path(f)) && File.exist?(parent) ? parent : f] }
+      titles = Claude.title_map(meta_paths.values.uniq)
       files.each do |path|
         id = Claude.session_id(path)
         s = (sessions[["claude", id]] ||= Session.new(tool: "claude", id: id))
-        parent = Claude.parent_path(path)
         if s.path.nil?
-          meta_path = parent && File.exist?(parent) ? parent : path
-          Claude.read_meta(meta_path, s)
+          meta_path = meta_paths[path]
+          Claude.read_meta(meta_path, s, titles)
           s.updated_at = File.mtime(meta_path)
         end
         s.updated_at = [s.updated_at, File.mtime(path)].compact.max
-        scan_file(path, s, matcher, opts, Claude, agent_id: Claude.agent_id(path)) unless opts[:list]
+        add_hits(s, scans[path], opts, Claude.agent_id(path)) unless opts[:list]
       end
     end
 
     if opts[:tools].include?("codex")
       files = Codex.files(opts[:codex_dir]).select { |f| in_range?(f, opts[:since], opts[:until]) }
-      files.reject! { |f| excluded?(Codex.session_id(f), opts) }
-      files = opts[:list] ? files.sort : candidate_files(files, matcher, ic) { |f| Codex.session_id(f) }
+      files = files.reject { |f| excluded?(Codex.session_id(f), opts) }
+      scans = {}
+      unless opts[:list]
+        scans = scan_files(files, matcher, opts, Codex)
+        files = candidate_files(scans, matcher) { |f| Codex.session_id(f) }
+      end
+      files = files.sort
       files.each do |path|
         id = Codex.session_id(path)
         s = (sessions[["codex", id]] ||= Session.new(tool: "codex", id: id))
         Codex.read_meta(path, s, opts[:codex_dir])
         s.updated_at = File.mtime(path)
-        scan_file(path, s, matcher, opts, Codex) unless opts[:list]
+        add_hits(s, scans[path], opts, nil) unless opts[:list]
       end
     end
 
@@ -614,7 +803,7 @@ module SessionGrep
     tool, path = find_session_file(id, opts)
     mod = tool == "claude" ? Claude : Codex
     s = Session.new(tool: tool, id: mod.session_id(path))
-    tool == "claude" ? Claude.read_meta(path, s) : Codex.read_meta(path, s, opts[:codex_dir])
+    tool == "claude" ? Claude.read_meta(path, s, Claude.title_map([path])) : Codex.read_meta(path, s, opts[:codex_dir])
     s.updated_at = File.mtime(path)
     s.last_message_at = last_message_at(path, mod)
     if opts[:json]
