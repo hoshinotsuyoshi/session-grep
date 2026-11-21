@@ -2,7 +2,7 @@ Third-party notices for the session-grep binary
 
 The session-grep binary in the release archives is compiled from bin/session-grep
 with Spinel (https://github.com/matz/spinel) at the commit in .spinel-version
-(d2449044a4901bc3b8b63e149fd61f83995b2418). Besides session-grep itself (see
+(5f01c67fc6ea694b49ec3610aab53df0fae5dd30). Besides session-grep itself (see
 LICENSE), it contains Spinel's runtime, code Spinel generates, and the parts of
 the libraries below that Spinel compiles into it. The Ruby script
 bin/session-grep does not include any of them.

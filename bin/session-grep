@@ -168,9 +168,9 @@ module SessionGrep
   RG_CHUNK = 500
 
   # Run rg over files and yield (file, line) for each matching line. Called in chunks so the argument
-  # list stays short. The chunk is a plain local, not an each_slice block parameter: the Spinel build
-  # doesn't keep that parameter alive for its GC, so a collection could free it while rg's arguments
-  # were being built and the binary then looped forever
+  # list stays short. The chunk is a plain local, not an each_slice block parameter: Spinel before
+  # matz/spinel@3a2d0d40d didn't always keep that parameter alive for its GC, so a collection could
+  # free it while rg's arguments were being built and the binary then looped forever
   def rg_lines(files, patterns, ignore_case)
     i = 0
     while i < files.size
@@ -273,9 +273,9 @@ module SessionGrep
   # files, like a Claude parent and its subagents). rg prints files in no fixed order, so sort them:
   # the order files are read in decides the order of hits with the same time and of the hit counts
   # (a parent session file sorts before its subagents).
-  # The sets are made with to_set and a block on purpose: when every Set in the program comes from a
-  # bare Set.new, the Spinel build compiles Set.new to a version whose sets its GC frees while they are
-  # still in use (Session#terms broke under SPINEL_GC_STRESS=2)
+  # The sets are made with to_set and a block on purpose: when every Set in the program came from a
+  # bare Set.new, Spinel before 5f01c67fc compiled Set.new to a version whose sets its GC freed while
+  # they were still in use (Session#terms broke under SPINEL_GC_STRESS=2)
   def candidate_files(scans, matcher, &session_key)
     files = scans.keys
     per_term = matcher.terms.map { |t| files.select { |f| scans[f].terms.include?(t) } }
