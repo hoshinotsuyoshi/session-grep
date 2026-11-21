@@ -11,6 +11,7 @@ It answers "which session was that conversation in?". It also works as a Claude 
 - Narrow with `--repo` (substring of the cwd), `--since` / `--until`, and `--tool claude|codex`
 - `--json` prints JSON Lines, one session per line (for agents)
 - `--show <id>` prints one session's messages in time order
+- `--list` prints the sessions in a directory or period without a word (`hits` is empty)
 - Subagent logs are merged into their parent session. Lines copied into a forked session are not counted twice
 - The session doing the search (`$CLAUDE_CODE_SESSION_ID`) is excluded by default
 - Any language works: words are matched as plain strings, so Japanese and other non-ASCII words work the same as English
@@ -51,10 +52,13 @@ session-grep maintenance --repo example-org --since 3d   # for humans
 session-grep maintenance --repo example-org --json       # for agents (JSON Lines)
 session-grep zprofile rbenv --since 2d                   # multiple words are ANDed
 session-grep --show 1234abcd                             # one session's messages in time order
+session-grep --list --cwd example-app-02 --since 7d      # recent sessions in a directory, no word needed
 session-grep --help
 ```
 
 Words are fixed strings, not regular expressions. Common words can take a few seconds across all logs, so narrow by time or repo.
+
+Exit status is 0 when something was found, 1 when nothing was, and 2 for a usage error (one line on stderr). `--json` is JSON Lines, one object per line; see `skills/session-grep/SKILL.md` for the keys and examples for agents.
 
 `--repo` matches the cwd the session was started in. A session started in another directory that touched this repo is not included; search without `--repo` if you don't want to miss it.
 

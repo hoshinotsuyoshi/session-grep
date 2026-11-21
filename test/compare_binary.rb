@@ -41,6 +41,11 @@ Dir.mktmpdir do |dir|
     %w[--since bogus zephyr],
     %w[--hits x zephyr],
     %w[--help],
+    %w[--list --cwd proj-03 --since 2026-01-20],
+    %w[--list --json --since 2026-01-20 --limit 3],
+    %w[--list],
+    %w[--list zephyr --since 2026-01-20],
+    %w[--since 2026-01-20],
   ]
 
   failures = cases.count do |args|

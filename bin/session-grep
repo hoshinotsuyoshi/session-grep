@@ -500,7 +500,8 @@ module SessionGrep
       files = Claude.files(opts[:claude_dir], opts[:cwd]).select { |f| in_range?(f, opts[:since], opts[:until]) }
       files.reject! { |f| Claude.parent_path(f) } unless opts[:subagents]
       files.reject! { |f| excluded?(Claude.session_id(f), opts) }
-      candidate_files(files, matcher, ic) { |f| Claude.session_id(f) }.each do |path|
+      files = opts[:list] ? files.sort : candidate_files(files, matcher, ic) { |f| Claude.session_id(f) }
+      files.each do |path|
         id = Claude.session_id(path)
         s = (sessions[["claude", id]] ||= Session.new(tool: "claude", id: id))
         parent = Claude.parent_path(path)
@@ -510,27 +511,29 @@ module SessionGrep
           s.updated_at = File.mtime(meta_path)
         end
         s.updated_at = [s.updated_at, File.mtime(path)].compact.max
-        scan_file(path, s, matcher, opts, Claude, agent_id: Claude.agent_id(path))
+        scan_file(path, s, matcher, opts, Claude, agent_id: Claude.agent_id(path)) unless opts[:list]
       end
     end
 
     if opts[:tools].include?("codex")
       files = Codex.files(opts[:codex_dir]).select { |f| in_range?(f, opts[:since], opts[:until]) }
       files.reject! { |f| excluded?(Codex.session_id(f), opts) }
-      candidate_files(files, matcher, ic) { |f| Codex.session_id(f) }.each do |path|
+      files = opts[:list] ? files.sort : candidate_files(files, matcher, ic) { |f| Codex.session_id(f) }
+      files.each do |path|
         id = Codex.session_id(path)
         s = (sessions[["codex", id]] ||= Session.new(tool: "codex", id: id))
         Codex.read_meta(path, s, opts[:codex_dir])
         s.updated_at = File.mtime(path)
-        scan_file(path, s, matcher, opts, Codex)
+        scan_file(path, s, matcher, opts, Codex) unless opts[:list]
       end
     end
 
     list = sessions.values
     list.select! { |s| s.cwd&.include?(opts[:cwd]) } if opts[:cwd]
     list.reject! { |s| s.subagents.any? { |a| a.start_with?("codex:") } } unless opts[:subagents]
-    # Drop sessions where the shown kinds of messages don't contain every word (--all checks all kinds)
-    list.select! { |s| s.hits.any? && terms.all? { |t| s.terms.include?(t) } }
+    # Drop sessions where the shown kinds of messages don't contain every word (--all checks all kinds).
+    # --list has no words and keeps every session in range
+    list.select! { |s| s.hits.any? && terms.all? { |t| s.terms.include?(t) } } unless opts[:list]
     list.each do |s|
       s.hits = s.hits.each_with_index.sort_by { |h, i| [h.ts.to_s, i] }.map(&:first)
       s.last_message_at = last_message_at(s.path, s.tool == "claude" ? Claude : Codex)
@@ -606,6 +609,8 @@ module SessionGrep
     mod = tool == "claude" ? Claude : Codex
     s = Session.new(tool: tool, id: mod.session_id(path))
     tool == "claude" ? Claude.read_meta(path, s) : Codex.read_meta(path, s, opts[:codex_dir])
+    s.updated_at = File.mtime(path)
+    s.last_message_at = last_message_at(path, mod)
     if opts[:json]
       io.puts JSON.generate(s.to_h([]).except(:hits, :hit_counts))
     else
@@ -644,12 +649,13 @@ module SessionGrep
       since: nil, until: nil, cwd: nil, limit: nil, max_hits: 3, subagents: true,
       claude_dir: env.fetch("SESSION_GREP_CLAUDE_DIR", File.join(Dir.home, ".claude", "projects")),
       codex_dir: env.fetch("SESSION_GREP_CODEX_DIR", File.join(Dir.home, ".codex")),
-      show: nil, full: false, terms: [], exclude: [], include_self: false
+      show: nil, full: false, list: false, terms: [], exclude: [], include_self: false
     }
     parser = OptionParser.new do |o|
       o.banner = <<~USAGE
         Usage: session-grep [options] WORD [WORD...]
                session-grep [options] -e WORD [-e WORD...]
+               session-grep --list [--cwd SUBSTR] [--since TIME] [--until TIME] [--json]
                session-grep --show SESSION_ID [--full] [--json]
 
         Search past Claude Code (~/.claude/projects) and codex (~/.codex/sessions) sessions
@@ -659,6 +665,8 @@ module SessionGrep
         - Sessions are listed oldest first by their last message (newest at the bottom). Matches within a session are in time order
         - Times are "HH:MM", or "MM-DD HH:MM" when the date differs from the previous line
         - The session running the search ($CLAUDE_CODE_SESSION_ID) is excluded by default
+        - --list lists the sessions in a --cwd / --since range without a WORD (hits are empty)
+        - Exit status: 0 = found, 1 = nothing found, 2 = usage error (one line on stderr)
 
       USAGE
       o.on("-e WORD", "Search word. Repeat for AND") { |v| opts[:terms] << v }
@@ -682,7 +690,8 @@ module SessionGrep
       o.on("--limit N", Integer, "Only the newest N sessions") { |v| opts[:limit] = v }
       o.on("--hits N", Integer, "Matching lines shown per session (default 3; --json prints all)") { |v| opts[:max_hits] = v }
       o.on("--json", "Print JSON Lines (one session per line)") { opts[:json] = true }
-      o.on("--show ID", "Print one session's messages in time order (ID is a prefix)") { |v| opts[:show] = v }
+      o.on("--list", "List sessions (no WORD) in the --cwd / --since / --until range") { opts[:list] = true }
+      o.on("--show ID","Print one session's messages in time order (ID is a prefix)") { |v| opts[:show] = v }
       o.on("--full", "With --show, don't truncate messages") { opts[:full] = true }
       o.on("--claude-dir DIR", "Default: ~/.claude/projects") { |v| opts[:claude_dir] = v }
       o.on("--codex-dir DIR", "Default: ~/.codex") { |v| opts[:codex_dir] = v }
@@ -695,14 +704,17 @@ module SessionGrep
   end
 
   def main(argv)
-    opts, parser = parse_args(argv)
+    opts, = parse_args(argv)
     if opts[:show]
       show(opts[:show], opts)
       return 0
     end
-    if opts[:terms].empty? || opts[:terms].any?(&:empty?)
-      warn parser.help
-      return 2
+    if opts[:list]
+      raise "--list takes no WORD; drop --list to search" unless opts[:terms].empty?
+      # Without rg narrowing, every file's metadata is read, so a range is required
+      raise "--list needs --cwd, --since or --until" unless opts[:cwd] || opts[:since] || opts[:until]
+    elsif opts[:terms].empty? || opts[:terms].any?(&:empty?)
+      raise "give a WORD to search, or --list to list sessions by --cwd / --since (see --help)"
     end
     list = search(opts[:terms].uniq, opts)
     opts[:json] ? print_json(list, opts) : print_text(list, opts)

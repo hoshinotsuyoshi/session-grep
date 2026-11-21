@@ -270,10 +270,85 @@ class SessionGrepTest < Minitest::Test
     refute_match(/AGENTS\.md/, out)
   end
 
+  # No WORD is a one-line usage error on stderr that points to --list; stdout stays empty
   def test_usage_error
-    _, err, status = run_cli
+    out, err, status = run_cli
     assert_equal 2, status.exitstatus
-    assert_match(/Usage/, err)
+    assert_equal 1, err.lines.size
+    assert_match(/--list/, err)
+    refute_match(/Usage:/, err)
+    assert_empty out
+    out, err, status = run_cli("--since", "1d", "--json")
+    assert_equal 2, status.exitstatus
+    assert_match(/give a WORD/, err)
+    assert_empty out
+  end
+
+  def test_list_sessions_by_cwd_and_since
+    list, _, status = json_cli("--list", "--cwd", "example-org", "--since", "1d")
+    assert_equal 0, status.exitstatus
+    assert_equal [SID, SID3, CODEX_ID, SID4].sort, list.map { |s| s["session_id"] }.sort
+    list.each do |s|
+      assert_equal [], s["hits"]
+      assert_equal({}, s["hit_counts"])
+      assert_includes s["cwd"], "example-org"
+      assert s["resume"]
+      assert s["last_message_at"]
+    end
+    times = list.map { |s| Time.parse(s["last_message_at"]) }
+    assert_equal times.sort, times
+    sid = list.find { |s| s["session_id"] == SID }
+    assert_equal "banana 対応", sid["title"]
+    assert_equal "最初の質問です", sid["first_prompt"]
+    assert_equal "2026-10-01T00:02:00Z", sid["last_message_at"]
+    assert_equal SID, list.find { |s| s["session_id"] == SID4 }["forked_from"]
+  end
+
+  def test_list_respects_tool_limit_and_exclude
+    list, = json_cli("--list", "--since", "1d", "--tool", "codex")
+    assert_equal [CODEX_ID], list.map { |s| s["session_id"] }
+    list, = json_cli("--list", "--since", "1d", "--limit", "1")
+    assert_equal [SID4], list.map { |s| s["session_id"] }
+    list, = json_cli("--list", "--since", "1d", "--exclude-session", SID[0, 8])
+    refute_includes list.map { |s| s["session_id"] }, SID
+  end
+
+  def test_list_text_output
+    out, _, status = run_cli("--list", "--cwd", "other/repo")
+    assert_equal 0, status.exitstatus
+    assert_match(/^2026-10-02 09:00  claude  #{Regexp.escape(CWD_B)}  main/, out)
+    assert_match(/first: apple の話/, out)
+    assert_match(/resume: cd .* && claude --resume #{SID2}/, out)
+    refute_match(/\[human/, out)
+  end
+
+  def test_list_requires_filter
+    out, err, status = run_cli("--list")
+    assert_equal 2, status.exitstatus
+    assert_match(/needs --cwd/, err)
+    assert_empty out
+  end
+
+  def test_list_rejects_words
+    out, err, status = run_cli("--list", "banana", "--since", "1d")
+    assert_equal 2, status.exitstatus
+    assert_match(/takes no WORD/, err)
+    assert_empty out
+  end
+
+  def test_list_nothing_found_is_exit_1
+    out, _, status = run_cli("--list", "--cwd", "nope", "--since", "1d")
+    assert_equal 1, status.exitstatus
+    assert_empty out
+  end
+
+  # The first line of --show --json has the session's times, like a search result
+  def test_show_json_has_times
+    out, _, status = run_cli("--show", SID[0, 8], "--json")
+    assert_equal 0, status.exitstatus
+    head = JSON.parse(out.lines.first)
+    assert_equal "2026-10-01T00:02:00Z", head["last_message_at"]
+    refute_nil head["updated_at"]
   end
 
   # A matching line whose date differs from the previous line shows "MM-DD HH:MM"
@@ -378,6 +453,8 @@ class SessionGrepTest < Minitest::Test
     assert_match(/cwd the session started in/, out)
     assert_match(/AND/, out)
     assert_match(/time order/, out)
+    assert_match(/Exit status: 0 = found, 1 = nothing found, 2 = usage error/, out)
+    assert_match(/--list/, out)
   end
 
   # Non-ASCII search words work, alone and ANDed with ASCII words

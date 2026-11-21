@@ -14,6 +14,7 @@ session-grep maintenance --repo example-org --since 3d   # for humans
 session-grep maintenance --repo example-org --json       # for agents (JSON Lines, one session per line)
 session-grep zprofile rbenv --since 2d                   # multiple words are ANDed (same as -e zprofile -e rbenv)
 session-grep --show 1234abcd                             # one session's human and agent messages in time order
+session-grep --list --cwd example-app-02 --since 7d      # recent sessions in a directory, no word needed
 ```
 
 - Words are fixed strings, not regular expressions. `-i` ignores case. Multiple words are ANDed (every word appears somewhere in the session's shown messages, not necessarily on the same line). Non-ASCII words such as Japanese work the same way.
@@ -27,20 +28,29 @@ session-grep --show 1234abcd                             # one session's human a
 
 ## Calling it from an agent
 
-- Always give at least one word. `--repo` / `--since` alone is a usage error: exit 2, with the usage on stderr and nothing on stdout.
-- Don't add `2>/dev/null`. With it, a usage error or a broken jq filter looks the same as "no sessions found". Use `2>&1`, or check the exit status.
-- `--json` prints JSON Lines: one object per line, not an array. Read it with `jq -r '.session_id'`, not `.[]`. The time keys are `started_at`, `last_message_at` and `updated_at`. `ts` and `text` exist only inside `hits[]`. Use only the keys listed under "Main JSON keys"; don't guess others.
+- Give at least one word. `--repo` / `--since` alone is a usage error: exit 2, one line on stderr, nothing on stdout. To see what happened in a directory without a word, use `--list` (below).
+- Exit status: 0 = found, 1 = nothing found, 2 = usage error. Check it, or use `2>&1`. Don't add `2>/dev/null`: with it, a usage error or a broken jq filter looks the same as "no sessions found".
+- `--json` prints JSON Lines: one object per line, not an array. Read it with `jq -r '.session_id'`, not `.[]`. One line looks like this (`hits` shortened):
+
+  ```json
+  {"tool":"claude","session_id":"0b9e2c4a-5d7f-4e1b-9a3c-6f2d8e7b1c05","cwd":"/Users/me/src/example-app-01","cwd_exists":true,"branch":"main","started_at":"2026-01-10T09:00:00.000Z","last_message_at":"2026-01-12T05:30:00.000Z","updated_at":"2026-01-12T05:30:01Z","title":"Fix login redirect","first_prompt":"...","forked_from":null,"hits":[{"kind":"human","ts":"2026-01-10T09:05:00.000Z","text":"who was working on PR 482?"}],"hit_counts":{"human":2,"agent":3,"tool":9},"subagents":[],"resume":"cd /Users/me/src/example-app-01 && claude --resume 0b9e2c4a-5d7f-4e1b-9a3c-6f2d8e7b1c05","path":"/Users/me/.claude/projects/.../0b9e2c4a-5d7f-4e1b-9a3c-6f2d8e7b1c05.jsonl"}
+  ```
+
+  The session's times are `started_at`, `last_message_at` and `updated_at`. `ts` and `text` exist only inside `hits[]`. There is no `summary`, `snippet`, `started` or `last_ts`; use only the keys listed under "Main JSON keys".
 
   ```sh
   session-grep 482 example-app --since 3w --json | jq -r '[.session_id[0:8], .last_message_at, .title] | @tsv'
+  session-grep 482 example-app --since 3w --json | jq -r '.hits[] | select(.kind == "human") | .text'
   ```
 
-- `--show ID --json`: the first line is the session (the same keys as a search result, without `hits`), and each following line is one message `{kind, ts, text}`.
+- `--show ID --json`: the first line is the session (the same keys as a search result, without `hits` and `hit_counts`), and each following line is one message `{kind, ts, text}`.
+- `--list --cwd DIR --since 7d [--json]`: the sessions in that directory and period, newest at the bottom, without searching for a word (`hits` is empty). Use it to see recent work in a clone before reusing it. `--list` needs `--cwd`, `--since` or `--until`.
 
 ## Choosing words
 
 - For an issue or PR, search the number and the repo name as two words (`4821 example-app`), not the URL or `repo#4821`. Logs write the same issue in several forms (URL, `owner/repo#N`, `#N`), and a single form misses the others.
 - Ids and names work well: Artifact ids, hc terminal names (`review-42`), branch names, rare product or tool names.
+- Use the word you already have (an issue number, a PR number) even when you also know the directory; `--cwd` alone lists, it doesn't answer "who did X".
 - When nothing matches: drop a word, add `--all` (to also search tool input and output), or widen `--since`.
 
 ## Kinds of matching lines
