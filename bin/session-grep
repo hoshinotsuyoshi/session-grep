@@ -165,15 +165,21 @@ module SessionGrep
     raise OptionParser::InvalidArgument, "can't parse time: #{str} (e.g. 3d, 12h, 2w, 2026-10-01)"
   end
 
-  # Keep only files containing the word, using rg. Called in chunks so the argument list stays short
-  def rg_filter(files, term, ignore_case)
-    return [] if files.empty?
+  RG_CHUNK = 500
 
+  # Keep only files containing the word, using rg. Called in chunks so the argument list stays short.
+  # The chunk is a plain local, not an each_slice block parameter: the Spinel build doesn't keep that
+  # parameter alive for its GC, so a collection could free it while rg's arguments were being built
+  # and the binary then looped forever
+  def rg_filter(files, term, ignore_case)
     found = []
-    files.each_slice(500) do |chunk|
+    i = 0
+    while i < files.size
+      chunk = files[i, RG_CHUNK]
+      i += RG_CHUNK
       args = ["rg", "-l", "-F", "--no-messages"]
       args << "-i" if ignore_case
-      args += ["-e", term, "--", *chunk]
+      args += ["-e", term, "--"] + chunk
       out, status = Open3.capture2(*args)
       raise "rg failed (status #{status.exitstatus})" if status.exitstatus > 1
 

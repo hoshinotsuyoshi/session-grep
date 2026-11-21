@@ -447,6 +447,30 @@ class SessionGrepTest < Minitest::Test
     assert_equal [SID2], list.map { |s| s["session_id"] }
   end
 
+  # SPINEL_GC_STRESS=2 makes a Spinel binary collect at every allocation and poison what it frees, so
+  # a value its GC doesn't keep alive breaks at once (the Ruby script ignores the variable). rg_filter
+  # once lost its each_slice chunk this way: the binary returned nothing, or looped forever
+  # (SPINEL_GC_STRESS=1 collects without poisoning, which made it loop instead, so a time limit is kept too)
+  def test_binary_keeps_values_alive_under_gc_stress
+    %w[2 1].each do |stress|
+      env = { "SESSION_GREP_CLAUDE_DIR" => @claude, "SESSION_GREP_CODEX_DIR" => @codex,
+              "CLAUDE_CODE_SESSION_ID" => "", "SPINEL_GC_STRESS" => stress }
+      [[%w[-e banana -e cherry --json], 1], [%w[--list --since 1d --json], 5]].each do |args, size|
+        out, status = Open3.popen2(env, *CLI, *args) do |stdin, stdout, wait|
+          stdin.close
+          reader = Thread.new { stdout.read }
+          unless wait.join(20)
+            Process.kill("KILL", wait.pid)
+            flunk "SPINEL_GC_STRESS=#{stress} #{args.join(' ')} did not finish in 20 seconds"
+          end
+          [reader.value, wait.value]
+        end
+        assert_equal 0, status.exitstatus, "SPINEL_GC_STRESS=#{stress} #{args.join(' ')}"
+        assert_equal size, out.lines.size, "SPINEL_GC_STRESS=#{stress} #{args.join(' ')}"
+      end
+    end
+  end
+
   # The help says that --repo matches the cwd the session started in
   def test_help_explains_repo_and_order
     out, = run_cli("--help")
