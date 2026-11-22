@@ -194,6 +194,38 @@ module SessionGrep
     end
   end
 
+  # The files containing the word, listed by rg -l (it stops reading a file at its first match)
+  def rg_files(files, term, ignore_case)
+    found = []
+    i = 0
+    while i < files.size
+      chunk = files[i, RG_CHUNK]
+      i += RG_CHUNK
+      args = ["rg", "-l", "-F", "--no-messages"]
+      args << "-i" if ignore_case
+      args += ["-e", term, "--"] + chunk
+      out = IO.popen(args, "rb", &:read)
+      raise "rg failed (status #{$?.exitstatus})" if $?.exitstatus > 1
+
+      found.concat(out.force_encoding(Encoding::UTF_8).split("\n"))
+    end
+    found
+  end
+
+  # With several words, keep only the files of sessions where every word appears in some file. Without
+  # this, a common word ANDed with a rare one would make rg print the common word's lines from every
+  # file. One word needs no narrowing: the line pass reads the same files
+  def files_with_all_terms(files, matcher, ignore_case, mod)
+    return files if matcher.terms.size < 2
+
+    common = nil
+    matcher.terms.each do |t|
+      keys = rg_files(files, t, ignore_case).to_set { |f| mod.session_id(f) }
+      common = common ? (common & keys) : keys
+    end
+    files.select { |f| common.include?(mod.session_id(f)) }
+  end
+
   # The words found in one file and its lines containing a word, judged line by line
   class FileScan
     attr_accessor :terms, :entries, :fork_origin
@@ -224,6 +256,7 @@ module SessionGrep
   def scan_files(files, matcher, opts, mod)
     scans = {}
     gate = !opts[:kinds].include?("meta")
+    files = files_with_all_terms(files, matcher, opts[:ignore_case], mod)
     rg_lines(files, matcher.terms, opts[:ignore_case]) do |file, line|
       scan = (scans[file] ||= FileScan.new)
       found = matcher.found(line)

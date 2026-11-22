@@ -36,7 +36,7 @@ install -m 755 session-grep-*-darwin-arm64/session-grep ~/.local/bin/session-gre
 
 On Linux, use `'*-linux-x86_64.tar.gz'` and `sha256sum --ignore-missing -c SHA256SUMS`. The Linux binary links glibc dynamically and needs glibc 2.34 or later (Ubuntu 22.04, Debian 12, RHEL 9 and newer).
 
-The binary is compiled from `bin/session-grep` with [Spinel](https://github.com/matz/spinel) (the version is in `.spinel-version`), and CI checks that it gives the same output as the script. It starts in about 4 ms instead of about 40 ms, and `--show` is about 3.5x faster, but searches are only 1.1-1.4x faster: most of their time goes to reading and parsing the matching log lines. (Measured on about 1.8 GB of real logs on macOS arm64 with Ruby 3.4.4 and 4.0.7: logs in the page cache, median of 7 runs, 7 sets of arguments.)
+The binary is compiled from `bin/session-grep` with [Spinel](https://github.com/matz/spinel) (the version is in `.spinel-version`), and CI checks that it gives the same output as the script. It starts in about 4 ms instead of about 40 ms, and `--show` is about 2x faster, but searches are only 1.0-1.6x faster: most of their time goes to rg and to parsing the lines it prints. Searches with the binary are 1.3-2.8x faster than with v0.1.1's, which read whole files after rg had found them. (Measured on about 2.2 GB of real logs on macOS arm64 with Ruby 3.4.4 and 4.0.7: logs in the page cache, median of 7 runs, 7 sets of arguments.)
 
 ### From source (Ruby)
 

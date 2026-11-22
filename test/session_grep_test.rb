@@ -584,6 +584,21 @@ class SessionGrepTest < Minitest::Test
     assert_equal %w[human agent], s["hits"].map { |h| h["kind"] }
   end
 
+  # With several words, only the files of sessions that have every word are read line by line (a
+  # subagent file without the words is kept with its parent); one word reads every file
+  def test_files_with_all_terms
+    files = Dir.glob(File.join(@claude, "**", "*.jsonl")).sort
+    one = SessionGrep::Matcher.new(["banana"], false)
+    assert_same files, SessionGrep.files_with_all_terms(files, one, false, SessionGrep::Claude)
+    two = SessionGrep::Matcher.new(%w[cherry durian], false)
+    kept = SessionGrep.files_with_all_terms(files, two, false, SessionGrep::Claude)
+    assert_equal ["#{SID}.jsonl", "agent-afable-1.jsonl"], kept.map { |f| File.basename(f) }
+    two_i = SessionGrep::Matcher.new(%w[CHERRY Durian], true)
+    assert_equal kept, SessionGrep.files_with_all_terms(files, two_i, true, SessionGrep::Claude)
+    none = SessionGrep::Matcher.new(%w[cherry grape], false)
+    assert_empty SessionGrep.files_with_all_terms(files, none, false, SessionGrep::Claude)
+  end
+
   def test_parse_time
     now = Time.utc(2026, 11, 1)
     assert_equal now - (3 * 86_400), SessionGrep.parse_time("3d", now: now)
